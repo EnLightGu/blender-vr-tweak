@@ -407,3 +407,44 @@ class Translate:
                     vert.co = base.copy()
             update(obj)
         self.base = {}
+
+def selection_geometry(context, max_points=4000, max_lines=8000, max_tris=12000):
+    """World-space points / edge segments / face triangles for the selection.
+
+    Computed by the 20 Hz timer (session.tick) and cached for the XR draw
+    handler: draw callbacks must not touch bpy.context on Windows (see
+    overlay.py), and rebuilding the batches once per tick is cheaper than
+    once per eye per frame.
+    """
+    points = []
+    lines = []
+    tris = []
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        matrix = obj.matrix_world
+        for vert in bm.verts:
+            if vert.select and not vert.hide:
+                points.append(tuple(matrix @ vert.co))
+                if len(points) >= max_points:
+                    break
+        for edge in bm.edges:
+            if edge.select and not edge.hide:
+                lines.append(tuple(matrix @ edge.verts[0].co))
+                lines.append(tuple(matrix @ edge.verts[1].co))
+                if len(lines) >= max_lines:
+                    break
+        for face in bm.faces:
+            if not face.select or face.hide:
+                continue
+            verts = [tuple(matrix @ v.co) for v in face.verts]
+            for i in range(1, len(verts) - 1):
+                tris.extend((verts[0], verts[i], verts[i + 1]))
+            for edge in face.edges:
+                lines.append(tuple(matrix @ edge.verts[0].co))
+                lines.append(tuple(matrix @ edge.verts[1].co))
+            if len(tris) >= max_tris or len(lines) >= max_lines:
+                break
+    return points, lines, tris

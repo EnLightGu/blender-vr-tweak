@@ -43,10 +43,25 @@ class VRTweakSettings(PropertyGroup):
     )
     move_speed: FloatProperty(
         name="Move Speed",
-        description="Left stick locomotion speed (m/s)",
-        default=1.5,
-        min=0.3,
-        max=6.0,
+        description="Left stick locomotion speed (m/s, scaled by the XR base/navigation scale)",
+        default=0.5,
+        min=0.1,
+        max=3.0,
+    )
+    invert_stick_x: BoolProperty(
+        name="Invert Stick X",
+        description="Flip the thumbstick left/right axis (strafe + snap turn); use when they go the wrong way",
+        default=False,
+    )
+    invert_stick_y: BoolProperty(
+        name="Invert Stick Y",
+        description="Flip the thumbstick forward/back axis",
+        default=False,
+    )
+    invert_grab: BoolProperty(
+        name="Invert Two-Hand View",
+        description="Flip the translation/rotation direction of two-handed view navigation",
+        default=False,
     )
     pinch_gain: FloatProperty(
         name="Pinch Gain",
@@ -216,6 +231,9 @@ class VRTWEAK_PT_panel(Panel):
         box.prop(settings, "vertical_move")
         box.prop(settings, "move_speed")
         box.prop(settings, "turn_angle")
+        box.prop(settings, "invert_stick_x")
+        box.prop(settings, "invert_stick_y")
+        box.prop(settings, "invert_grab")
         box.prop(settings, "pinch_gain")
         box.prop(settings, "view_pinch_gain")
         box.prop(settings, "pinch_invert")

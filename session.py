@@ -34,6 +34,9 @@ _STATE = {
     "x_click": False,
     "hud": None,
     "preselect": None,
+    "sel": ((), (), ()),
+    "sel_t": 0.0,
+    "mode_name": "VERT",
 }
 
 
@@ -78,7 +81,7 @@ def _update_hud(context, text, tint=(1.0, 1.0, 1.0, 1.0)):
         if mat is None:
             mat = bpy.data.materials.new("vrtweak_hud_mat")
             mat.use_nodes = True
-            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            bsdf = next((n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)
             if bsdf:
                 bsdf.inputs["Base Color"].default_value = tint
                 bsdf.inputs["Emission Color"].default_value = tint
@@ -103,6 +106,32 @@ def _remove_hud():
             bpy.data.objects.remove(obj, do_unlink=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _stick(context, hand):
+    """Stick vector with the per-axis panel inversion applied."""
+    x, y = actions.vector(context, "stick", hand)
+    settings = context.scene.vrtweak
+    if settings.invert_stick_x:
+        x = -x
+    if settings.invert_stick_y:
+        y = -y
+    return Vector((x, y))
+
+
+def _move_speed(context, state):
+    """User speed scaled like Blender's own VR fly navigation."""
+    settings = context.scene.vrtweak
+    scale = 1.0
+    try:
+        scale = float(state.navigation_scale)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        scale *= float(context.window_manager.xr_session_settings.base_scale)
+    except Exception:  # noqa: BLE001
+        pass
+    return settings.move_speed * max(0.05, min(10.0, scale))
 
 
 def _stick_delta(rotation, stick, dt, speed):
@@ -136,7 +165,8 @@ def _turn(state, angle_deg):
 
 def _navigate(context, state, dt):
     settings = context.scene.vrtweak
-    stick = Vector(actions.vector(context, "stick", 0))
+    stick = _stick(context, 0)
+    speed = _move_speed(context, state)
     rotation = Quaternion(state.viewer_pose_rotation)
     if settings.vertical_move:
         right = rotation @ Vector((1.0, 0.0, 0.0))
@@ -146,12 +176,12 @@ def _navigate(context, state, dt):
         strength = min(stick.length, 1.0) - 0.15
         amount = (max(strength, 0.0) / 0.85) if stick.length > 0.15 else 0.0
         name = stick.normalized() if stick.length > 1e-6 else Vector((0.0, 0.0))
-        delta = (right * name.x + Vector((0.0, 0.0, 1.0)) * name.y) * amount * dt * settings.move_speed
+        delta = (right * name.x + Vector((0.0, 0.0, 1.0)) * name.y) * amount * dt * speed
     else:
-        delta = _stick_delta(rotation, stick, dt, settings.move_speed)
+        delta = _stick_delta(rotation, stick, dt, speed)
     if delta.length:
         state.navigation_location = Vector(state.navigation_location) + delta
-    turn_stick = actions.vector(context, "stick", 1)[0]
+    turn_stick = _stick(context, 1).x
     if abs(turn_stick) > 0.65:
         if _STATE["turn_armed"]:
             _STATE["turn_armed"] = False
@@ -210,7 +240,7 @@ def start(context):
         handle.write("# vrtweak input log\n")
     actions.reset()
     _toggle(context)
-    overlay.add()
+    overlay.add(context)
     _ensure_hud(context)
     _STATE.update({
         "last": 0.0,
@@ -313,6 +343,7 @@ def _log_line(context, hand, label):
         f"stick={tuple(round(v, 2) for v in actions.vector(context, 'stick', hand))}",
         f"sel={count}",
         f"grab={_STATE['grabbing']}",
+        f"pinch={(_STATE['pinch'].get('angle', 0.0) if _STATE['pinch'] else 0.0):.1f}",
     ]
     return " ".join(parts)
 
@@ -328,9 +359,34 @@ def tick():
     state = context.window_manager.xr_session_state
 
     hand = 1 if settings.hand == "RIGHT" else 0
-    tip_loc, _ = tip.read(context, hand, settings.tip_offset, settings.tip_source)
+    tip_loc, grip_loc = tip.read(context, hand, settings.tip_offset, settings.tip_source)
     left_tip, _ = tip.read(context, 0, settings.tip_offset, settings.tip_source)
     right_tip, _ = tip.read(context, 1, settings.tip_offset, settings.tip_source)
+
+    # Publish draw data for the XR draw handler. It must not touch bpy.context
+    # itself (Blender 4.4.3 on Windows crashes on context.window_manager there).
+    now = time.time()
+    if now - _STATE["sel_t"] >= 0.1:
+        _STATE["sel_t"] = now
+        try:
+            _STATE["sel"] = mesh.selection_geometry(context)
+        except Exception:  # noqa: BLE001
+            _STATE["sel"] = ((), (), ())
+    _STATE["mode_name"] = (
+        "VERT" if context.tool_settings.mesh_select_mode[0]
+        else ("EDGE" if context.tool_settings.mesh_select_mode[1] else "FACE")
+    )
+    points, lines, tris = _STATE["sel"]
+    overlay.update(
+        tip=tip_loc,
+        grip=grip_loc,
+        radius=settings.brush_radius,
+        mode=_STATE["mode_name"],
+        vertical=settings.vertical_move,
+        points=points,
+        lines=lines,
+        tris=tris,
+    )
 
     trigger_l = actions.value(context, "trigger", 0) > 0.55
     trigger_r = actions.value(context, "trigger", 1) > 0.55
@@ -358,15 +414,36 @@ def tick():
         if pinch is None:
             handler = mesh.Pinch()
             grabbed = handler.begin(context)
+            nav_rot = Quaternion(state.navigation_rotation) if state is not None else Quaternion()
+            nav_loc = Vector(state.navigation_location) if state is not None else Vector()
+            nav_scale = float(state.navigation_scale) if state is not None else 1.0
+            viewer = Vector(state.viewer_pose_location) if state is not None else None
+            base_mid = base_axis = base_viewer = None
+            if state is not None:
+                # Controller poses are returned world-space (navigation applied), so undo
+                # the current nav transform to measure the hands in base space. Measuring
+                # in world space would feed our own navigation back in (endless spin).
+                inv_rot = nav_rot.inverted()
+                inv_scale = 1.0 / max(nav_scale, 1e-6)
+                left_base = inv_rot @ (left_tip - nav_loc) * inv_scale
+                right_base = inv_rot @ (right_tip - nav_loc) * inv_scale
+                base_mid = (left_base + right_base) * 0.5
+                if (right_base - left_base).length > 1e-5:
+                    base_axis = (right_base - left_base).normalized()
+                base_viewer = inv_rot @ (viewer - nav_loc) * inv_scale
             _STATE["pinch"] = {
                 "handler": handler if grabbed else None,
                 "start_dist": max(distance, 1e-4),
                 "start_mid": mid.copy(),
-                "nav_loc": Vector(state.navigation_location) if state is not None else None,
-                "nav_scale": float(state.navigation_scale) if state is not None else 1.0,
-                "nav_rot": Quaternion(state.navigation_rotation) if state is not None else Quaternion(),
-                "viewer": Vector(state.viewer_pose_location) if state is not None else None,
+                "nav_loc": nav_loc,
+                "nav_scale": nav_scale,
+                "nav_rot": nav_rot,
+                "viewer": viewer,
                 "axis": (right_tip - left_tip).normalized() if (right_tip - left_tip).length > 1e-5 else None,
+                "base_mid": base_mid,
+                "base_axis": base_axis,
+                "base_viewer": base_viewer,
+                "angle": 0.0,
             }
             settings.status = "two-hand grab: selection" if grabbed else "two-hand grab: view"
         else:
@@ -379,22 +456,55 @@ def tick():
                 rotation = pinch["axis"].rotation_difference(axis.normalized())
             if pinch["handler"] is not None:
                 pinch["handler"].apply(context, delta, factor, rotation)
+                overlay.hide_rotation()
             elif state is not None:
+                # Measure the hands in base space (see the pinch start above).
+                nav_rot_now = Quaternion(state.navigation_rotation)
+                nav_loc_now = Vector(state.navigation_location)
+                scale_now = max(float(state.navigation_scale), 1e-6)
                 view_factor = max(0.2, min(5.0, 1.0 + shift * settings.view_pinch_gain))
-                offset = pinch["nav_loc"] + delta
-                if rotation is not None and pinch["viewer"] is not None:
-                    relative = pinch["viewer"] - offset
-                    offset = offset + relative - rotation @ relative
-                    state.navigation_rotation = rotation @ pinch["nav_rot"]
+                inv_rot = nav_rot_now.inverted()
+                inv_scale = 1.0 / scale_now
+                left_base = inv_rot @ (left_tip - nav_loc_now) * inv_scale
+                right_base = inv_rot @ (right_tip - nav_loc_now) * inv_scale
+                base_mid_now = (left_base + right_base) * 0.5
+                delta_base = base_mid_now - pinch["base_mid"]
+                base_axis_now = None
+                if (right_base - left_base).length > 1e-5:
+                    base_axis_now = (right_base - left_base).normalized()
+                hand_rot = None
+                if pinch.get("base_axis") is not None and base_axis_now is not None:
+                    hand_rot = pinch["base_axis"].rotation_difference(base_axis_now)
+
+                if settings.invert_grab:
+                    delta_base = -delta_base
+                    if hand_rot is not None:
+                        hand_rot = hand_rot.inverted()
+
+                if hand_rot is not None:
+                    new_rot = (pinch["nav_rot"] @ hand_rot.inverted()).normalized()
                 else:
-                    state.navigation_rotation = pinch["nav_rot"]
-                state.navigation_location = offset
+                    new_rot = pinch["nav_rot"].copy()
+                if pinch["base_viewer"] is not None:
+                    new_loc = pinch["viewer"] - (new_rot @ (pinch["base_viewer"] + delta_base)) * pinch["nav_scale"]
+                else:
+                    new_loc = nav_loc_now
+                state.navigation_rotation = new_rot
+                state.navigation_location = new_loc
                 applied = (1.0 / view_factor) if settings.pinch_invert else view_factor
                 state.navigation_scale = max(0.1, min(10.0, pinch["nav_scale"] * applied))
+
+                angle_deg = math.degrees(hand_rot.angle) if hand_rot is not None else 0.0
+                pinch["angle"] = angle_deg
+                axis_world = None
+                if hand_rot is not None and angle_deg >= 0.5:
+                    axis_world = (nav_rot_now @ hand_rot.axis).normalized()
+                overlay.show_rotation(mid, axis_world, angle_deg, pinch["viewer"])
         _STATE["trigger_r"] = True
         return 0.05
     if _STATE["pinch"] is not None:
         pinch, _STATE["pinch"] = _STATE["pinch"], None
+        overlay.hide_rotation()
         if pinch["handler"] is not None:
             try:
                 undo.push_base(context, pinch["handler"].base)
