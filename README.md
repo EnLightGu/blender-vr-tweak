@@ -29,6 +29,13 @@
 
 ## 更新记录
 
+### 0.0.3（2026-11-21）
+
+- 新增**左手悬浮面板**：快捷方式速查 + 10 个编辑按钮（全选/取消/反选/相连/合并/删除/平滑/撤销/保存/编辑模式），右手柄 aim 射线 + 右扳机点击，左手 `Y` 开关
+- 放宽进入 VR 的条件：没选中网格也能进（只读视图），面板「编辑/物体」可随时切换编辑模式
+- 面板悬停时右扳机不再触发刷选
+- 新增 `mesh.py` 选择/拓扑操作：全选、反选、选择相连、合并顶点、删除顶点
+
 ### 0.0.2（2026-11-21）
 
 - 适配 Blender 4.4.3：清单最低版本改为 `4.4.0`（用到的 XR API 与 5.2 文档逐项核对一致）
@@ -57,13 +64,14 @@
 - **移动与转向**：左摇杆平面移动（可切换成升降），右摇杆左右 30° 快速转身；
 - **双手捏合**：左右扳机同时按住，有选中就缩放/旋转选中，没有选中就缩放/平移/旋转视野；旋转场景时会显示**旋转中轴线、旋转角度和方向箭头**（角度按"手转了多少度"实时更新，手停后不再自转）；
 - **可视化**：控制器 grip 环、笔尖刷子环（颜色随选择模式变化）、选中元素高亮、视野内 HUD 文本（显示预选对象与模式）。
+- **悬浮面板**：左手柄前上方一块面板，写着当前快捷方式，并有 10 个编辑按钮（全选/反选/合并/删除/平滑/保存…），右手射线 + 扳机点击，左手 `Y` 开关。
 
 项目信息：
 
 | 项 | 值 |
 | --- | --- |
 | 扩展名 / ID | `VR Tweak` / `blender_vr_tweak` |
-| 版本 | `0.0.2` |
+| 版本 | `0.0.3` |
 | 声明的最低 Blender | `5.2.0`（见 `blender_manifest.toml`） |
 | 许可 | GPL-3.0-or-later |
 | 规模 | 8 个文件、约 1700 行 Python |
@@ -91,6 +99,36 @@
 | 右摇杆左右 | `stick`（右手） | 超过 0.65 时转身 `Turn Angle`（默认 30°），带回滞 | — |
 | 双扳机 | `trigger` L+R | 捏合：有选中→缩放/旋转选中；无选中→缩放/平移/旋转视野。场景旋转时显示中轴/角度/箭头 | 双手都有笔尖位置 |
 
+### 2.1 悬浮面板（左手）
+
+设计思路：**离散命令交给面板，连续操作留给你手里的感觉**。刷选、拖动、平滑这些需要手感的事仍然用手柄完成；全选、反选、合并、删除这类一次性命令做成面板按钮，不用记更多组合键。
+
+- **位置**：悬浮在左手柄前上方约 14 cm，始终转向你（billboard），跟着左手移动
+- **开关**：左手 `Y` 显示 / 隐藏（默认显示）
+- **指向**：右手柄的 aim 射线，面板上会画出一条青色激光
+- **点击**：射线停在按钮上时按**右扳机**；此时扳机不会再触发刷选（悬停时自动吞掉）
+- **反馈**：悬停按钮变青色，`Status` 显示 `panel: <按钮>`
+
+面板上半部分是当前快捷方式速查，下半部分是 10 个按钮：
+
+| 按钮 | 作用 |
+| --- | --- |
+| 全选 | 选中当前编辑网格的所有元素 |
+| 取消选择 | 清空选择 |
+| 反选 | 反转当前选择 |
+| 选择相连 | 从已选顶点扩展整块连通区域 |
+| 合并顶点 | 选中顶点按 0.1 mm 阈值合并（`bmesh.ops.remove_doubles`） |
+| 删除顶点 | 删除选中顶点（`bmesh.ops.delete`） |
+| 平滑 | 对选中顶点做 2 次拉普拉斯平滑 |
+| 撤销 | 插件内撤销一步 |
+| 保存 | 异步保存（有 `.blend` 存原文件，否则写桌面副本） |
+| 编辑/物体 | 在编辑模式 / 物体模式之间切换 |
+
+### 2.2 为什么以前必须选中物体才能进 VR？
+
+这是**插件实现上的选择，不是 Blender 的要求**。`session.start()` 第一行就是 `mesh.ensure_edit(context)`：它要求存在 active 网格并进入编辑模式，否则抛 `Select a mesh object first`。原因是整个工具只对编辑模式下的 bmesh 工作（刷选、拾取、拖动都基于 `bmesh.from_edit_mesh`），而进 VR 后没有键盘，作者干脆在启动前强制进入。
+
+0.0.3 起放宽了：启动时按「active 网格 → 已选网格 → 场景里唯一的网格」顺序尝试进入编辑；都不满足也照样进 VR（只读视图，面板和导航可用），HUD 会提示「未进入编辑模式」，点面板上的「编辑/物体」即可随时切换。
 关键参数（`VRTweakSettings`，存在场景里，随 `.blend` 保存）：
 
 | 参数 | 默认 | 作用 |
@@ -118,9 +156,10 @@
 | --- | --- | --- |
 | `__init__.py` | 292 | 扩展入口：属性组 `VRTweakSettings`、5 个 Operator（start / stop / undo / redo / save）、3D 视图侧栏面板「VR Tweak」、注册/注销；并把 `actions.session_pre` 挂到 `bpy.app.handlers.xr_session_start_pre` |
 | `actions.py` | 232 | 自建 OpenXR action set（名为 `vrtweak`）：grip/aim pose、trigger、squeeze、stick、stick_click、a/b/x/y、haptic；按 touch / index / vive / simple 四种交互 profile 建绑定；读取封装与调试日志 |
-| `session.py` | 640 | 会话状态机：启停 XR、20 Hz 定时器 `tick()`、输入→行为映射、导航、HUD 文本、toast 提示、异步保存、震动、输入日志 |
-| `mesh.py` | 450 | 编辑模式网格操作（全部经 bmesh）：顶点/边/面拾取、刷选、清空、选择模式循环、Laplacian 平滑，以及 `Translate` / `Scale` / `Pinch` 三个实时变换器 |
+| `session.py` | 715 | 会话状态机：启停 XR、20 Hz 定时器 `tick()`、输入→行为映射、导航、HUD 文本、toast 提示、异步保存、震动、输入日志 |
+| `mesh.py` | 582 | 编辑模式网格操作（全部经 bmesh）：顶点/边/面拾取、刷选、清空、选择模式循环、Laplacian 平滑，以及 `Translate` / `Scale` / `Pinch` 三个实时变换器 |
 | `undo.py` | 90 | 插件内撤销/重做栈（上限 50 步，存 bmesh 顶点坐标的 before/after） |
+| `panel.py` | 293 | 左手悬浮面板：快捷方式文本 + 10 个按钮、billboard、右手 aim 射线拾取与点击派发 |
 | `overlay.py` | 333 | 场景物体式 overlay：grip 环、笔尖刷子环、选中元素高亮，以及双扳机旋转时的**中轴线 / 角度文字 / 方向箭头**（不使用 XR 绘制回调，见 5.5 ⑤） |
 | `tip.py` | 25 | 笔尖位置：AIM / GRIP / GRIP+offset |
 | `blender_manifest.toml` | 9 | 扩展清单 |
@@ -157,14 +196,14 @@ OpenXR runtime ──(action 值 / 控制器姿态)──> actions.py
 blender --command extension build --source-dir <仓库根目录> --output-dir <输出目录>
 ```
 
-产物是 `blender_vr_tweak-0.0.2.zip`（约 19 KB，只含 8 个文件，自动排除 `.git`、`.gitignore`、`dist/`、`README.md`）。
+产物是 `blender_vr_tweak-0.0.3.zip`（约 24 KB，只含 9 个文件，自动排除 `.git`、`.gitignore`、`dist/`、`README.md`）。
 
 安装（二选一）：
 
 - **图形界面**：`Preferences → Get Extensions → 右上角下拉 → Install from Disk…`，选中 zip，勾选启用；
 - **命令行**：
   ```bash
-  blender --command extension install-file -r user_default -e blender_vr_tweak-0.0.2.zip
+  blender --command extension install-file -r user_default -e blender_vr_tweak-0.0.3.zip
   ```
 
 安装后模块名为 `bl_ext.user_default.blender_vr_tweak`。
@@ -287,7 +326,7 @@ blender_version_min = "4.4.0"
 ```powershell
 & $blender --command extension validate $stage        # 可选：先校验清单
 & $blender --command extension build --source-dir $stage --output-dir $out
-& $blender --command extension install-file -r user_default -e "$out\blender_vr_tweak-0.0.2.zip"
+& $blender --command extension install-file -r user_default -e "$out\blender_vr_tweak-0.0.3.zip"
 ```
 
 也可以走图形界面：`Preferences → Get Extensions → 下拉 → Install from Disk…` 选 zip，勾选启用。
@@ -485,12 +524,13 @@ Blender 4.4.3 ──OpenXR──> SteamVR（ActiveRuntime，vrclient_x64.dll）
 - 2026-11-21 22:48 导航校准版：新增 `Invert Stick X` / `Invert Stick Y` / `Invert Two-Hand View` 三个面板开关；`move_speed` 默认 1.5 → 0.5，并按 `base_scale × navigation_scale` 缩放（对齐 Blender 自身 fly 导航的做法）
 - 日志观察（用户首次成功会话）：左摇杆用满量程，**右摇杆全程为 0**（可能没推，或右摇杆映射待查）；双扳机峰值 0.53/0.56，未触发双手捏合（阈值 0.55）
 - 2026-11-21 23:10 双扳机修复版：控制器姿态改在 base 空间测量，消除"停手后继续自转"；新增旋转中轴/角度/方向箭头 gizmo；输入日志新增 `pinch=角度` 字段；仿真验证 40° 零漂移
+- 2026-11-21 23:30 面板版 0.0.3：左手悬浮面板（快捷方式 + 10 个编辑按钮，右手射线点击，左Y 开关）；启动不再强制要求选中网格；离线与真实 XR 会话仿真验证按钮点击（全选：0 → 8 个顶点选中）
 
 改代码后如何更新（扩展目录里是安装时的副本，改仓库不会自动同步）：
 
 ```powershell
 & $blender --command extension build --source-dir $repo --output-dir $out
-& $blender --command extension install-file -r user_default -e "$out\blender_vr_tweak-0.0.2.zip"
+& $blender --command extension install-file -r user_default -e "$out\blender_vr_tweak-0.0.3.zip"
 ```
 
 卸载：`Preferences → Get Extensions` 里找到 VR Tweak 卸载，或直接删掉上面那个目录。
@@ -511,6 +551,7 @@ Blender 4.4.3 ──OpenXR──> SteamVR（ActiveRuntime，vrclient_x64.dll）
 10. 原始清单声明的最低版本是 5.2（作者环境）；本仓库已按第 5 节放宽到 4.4.0，并在 4.4.3 上实测可用。
 11. 会话期间插件把 active action set 切成自建的 `vrtweak`，Blender 内置的 VR 交互（默认动作集）是否还能共存，代码里没做处理，需实测。
 12. overlay 已改为场景物体（grip 环 / 刷子环 / 选中边面网格）：VR 会话中保存 `.blend` 会把它们和 HUD 一起写进文件；停止 VR 时会删除。
+13. 悬浮面板同样是场景物体（26 个对象：背景/边框/标题/速查文本/10 按钮+10 标签/激光），VR 会话中保存会写入文件，停止 VR 时删除。
 
 ## 7. 下一步建议（P2+）
 
@@ -528,8 +569,8 @@ Blender 4.4.3 ──OpenXR──> SteamVR（ActiveRuntime，vrclient_x64.dll）
 打包（原清单，5.2.0）——能打出来，但装不进 4.4.3：
 
 ```text
-building: blender_vr_tweak-0.0.2.zip
-created: "...\blender_vr_tweak-0.0.2.zip", 19716
+building: blender_vr_tweak-0.0.3.zip
+created: "...\blender_vr_tweak-0.0.3.zip", 24435
 ```
 
 安装（4.4.3，隔离用户目录）：
@@ -541,7 +582,7 @@ Package should have been installed but not found: blender_vr_tweak
 改 `blender_version_min = "4.4.0"` 后重新打包并安装，然后启用：
 
 ```text
-$ blender --command extension build   → created: blender_vr_tweak-0.0.2.zip
+$ blender --command extension build   → created: blender_vr_tweak-0.0.3.zip
 $ blender --command extension install-file -r user_default -e ...zip
 $ blender --background --python check.py
 ADDONS [... 'bl_ext.user_default.blender_vr_tweak']

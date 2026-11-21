@@ -11,7 +11,7 @@ import time
 import bpy
 from mathutils import Quaternion, Vector
 
-from . import actions, mesh, overlay, tip, undo
+from . import actions, mesh, overlay, panel, tip, undo
 
 LOG_PATH = os.path.join(tempfile.gettempdir(), "vrtweak-input.log")
 
@@ -37,6 +37,9 @@ _STATE = {
     "sel": ((), (), ()),
     "sel_t": 0.0,
     "mode_name": "VERT",
+    "panel_visible": True,
+    "ui_hover": False,
+    "y_click": False,
 }
 
 
@@ -223,6 +226,7 @@ def _cleanup(context):
         except Exception:  # noqa: BLE001
             pass
         _STATE["timer"] = None
+    panel.remove()
     overlay.remove()
     _remove_hud()
     actions.reset()
@@ -234,13 +238,16 @@ def _cleanup(context):
 
 def start(context):
     settings = context.scene.vrtweak
-    mesh.ensure_edit(context)
+    # View-only sessions are allowed: the panel's 编辑/物体 button can enter edit mode later.
+    if not mesh.try_enter_edit(context):
+        settings.status = "view only（左Y → 编辑/物体）"
     undo.clear()
     with open(LOG_PATH, "w", encoding="utf-8") as handle:
         handle.write("# vrtweak input log\n")
     actions.reset()
     _toggle(context)
     overlay.add(context)
+    panel.add(context)
     _ensure_hud(context)
     _STATE.update({
         "last": 0.0,
@@ -348,6 +355,39 @@ def _log_line(context, hand, label):
     return " ".join(parts)
 
 
+def _queue_save():
+    bpy.app.timers.register(_save_async, first_interval=0.01)
+
+
+def _panel_dispatch(context):
+    """Map floating-panel button ids to mesh operations."""
+    settings = context.scene.vrtweak
+
+    def wrap(action, label):
+        def _run(ctx):
+            try:
+                result = action(ctx)
+                settings.status = f"panel: {label}"
+                return result
+            except Exception as exc:  # noqa: BLE001
+                settings.status = f"panel {label} 失败: {exc}"
+                return None
+        return _run
+
+    return {
+        "select_all": wrap(mesh.select_all, "全选"),
+        "deselect": wrap(mesh.deselect_all, "取消选择"),
+        "invert": wrap(mesh.invert_selection, "反选"),
+        "linked": wrap(mesh.select_linked, "选择相连"),
+        "merge": wrap(mesh.merge_selected, "合并顶点"),
+        "delete": wrap(mesh.delete_selected, "删除顶点"),
+        "smooth": wrap(lambda ctx: mesh.smooth_selection(ctx, settings.smooth_strength, 2), "平滑"),
+        "undo": wrap(lambda ctx: undo.undo(ctx), "撤销"),
+        "save": wrap(lambda ctx: _queue_save(), "保存"),
+        "editmode": wrap(mesh.toggle_edit_mode, "编辑模式"),
+    }
+
+
 def tick():
     context = bpy.context
     if not _is_running(context):
@@ -390,6 +430,38 @@ def tick():
 
     trigger_l = actions.value(context, "trigger", 0) > 0.55
     trigger_r = actions.value(context, "trigger", 1) > 0.55
+
+    # Floating panel (left hand) + right aim ray picking.
+    y_click = actions.value(context, "y_click", 0) > 0.55
+    if y_click and not _STATE["y_click"]:
+        _STATE["panel_visible"] = not _STATE["panel_visible"]
+        _toast("面板显示" if _STATE["panel_visible"] else "面板隐藏")
+    _STATE["y_click"] = y_click
+    ui = {"hover": False, "clicked": None}
+    if state is not None and not (trigger_l and trigger_r):
+        try:
+            grip_pose = actions.pose(context, 0)
+            aim_pose = actions.aim_pose(context, 1)
+            ui = panel.update(
+                context,
+                viewer=Vector(state.viewer_pose_location),
+                grip_loc=grip_pose[0],
+                grip_rot=grip_pose[1],
+                aim_loc=aim_pose[0],
+                aim_rot=aim_pose[1],
+                trigger=trigger_r,
+                visible=_STATE["panel_visible"],
+                dispatch=_panel_dispatch(context),
+            )
+        except Exception as exc:  # noqa: BLE001
+            settings.status = f"panel error: {exc}"
+            ui = {"hover": False, "clicked": None}
+    else:
+        panel.hide()
+    _STATE["ui_hover"] = bool(ui.get("hover"))
+    if ui.get("clicked"):
+        settings.status = f"panel: {ui['clicked']}"
+
     if _STATE["hud"] is not None and tip_loc is not None and not _STATE["grabbing"] and _STATE["pinch"] is None:
         if time.time() - _STATE.get("last_pick", 0.0) > 0.1:
             _STATE["last_pick"] = time.time()
@@ -398,12 +470,15 @@ def tick():
                 _STATE["preselect"] = (obj, kind, index) if obj is not None else None
             except Exception:  # noqa: BLE001
                 _STATE["preselect"] = None
-        mode = "顶点" if context.tool_settings.mesh_select_mode[0] else ("边" if context.tool_settings.mesh_select_mode[1] else "面")
-        preselect = _STATE["preselect"]
-        if preselect and preselect[0] is not None:
-            text = f"预选：{preselect[0].name} / {mode}"
+        if not mesh.objects_in_edit(context):
+            text = "未进入编辑模式（左Y 面板 → 编辑/物体）"
         else:
-            text = f"预选：无（{mode}）"
+            mode = "顶点" if context.tool_settings.mesh_select_mode[0] else ("边" if context.tool_settings.mesh_select_mode[1] else "面")
+            preselect = _STATE["preselect"]
+            if preselect and preselect[0] is not None:
+                text = f"预选：{preselect[0].name} / {mode}"
+            else:
+                text = f"预选：无（{mode}）"
         _update_hud(context, text)
     elif _STATE["hud"] is not None:
         _update_hud(context, "移动中" if _STATE["pinch"] is None else "双手操作中")
@@ -534,7 +609,7 @@ def tick():
     fine = actions.value(context, "trigger", 0) > 0.55
 
     # 1) brush selection while the right trigger is held
-    if tip_loc is not None and trigger:
+    if tip_loc is not None and trigger and not _STATE["ui_hover"]:
         radius = settings.brush_radius
         try:
             if not _STATE["trigger_r"]:

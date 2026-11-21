@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "blender_vr_tweak"
-version = "0.0.2"
+version = "0.0.3"
 name = "VR Tweak"
 tagline = "Direct mesh tweaking in VR"
 maintainer = "enlight"

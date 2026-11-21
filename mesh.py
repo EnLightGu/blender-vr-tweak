@@ -448,3 +448,135 @@ def selection_geometry(context, max_points=4000, max_lines=8000, max_tris=12000)
             if len(tris) >= max_tris or len(lines) >= max_lines:
                 break
     return points, lines, tris
+
+# ---------------------------------------------------------------------------
+# Floating-panel / view-only helpers
+# ---------------------------------------------------------------------------
+
+def try_enter_edit(context):
+    """Enter edit mode on a sensible mesh; return False instead of raising."""
+    active = context.view_layer.objects.active
+    meshes = []
+    if active is not None and active.type == "MESH":
+        meshes = [active]
+    if not meshes:
+        meshes = [o for o in context.selected_objects if o.type == "MESH"]
+    if not meshes:
+        candidates = [o for o in context.scene.objects if o.type == "MESH"]
+        if len(candidates) == 1:
+            meshes = candidates
+    if not meshes:
+        return False
+    target = meshes[0]
+    try:
+        context.view_layer.objects.active = target
+        target.select_set(True)
+        if target.mode != "EDIT":
+            bpy.ops.object.mode_set(mode="EDIT")
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(objects_in_edit(context))
+
+
+def toggle_edit_mode(context):
+    if context.mode == "EDIT":
+        leave_edit(context)
+        return False
+    return try_enter_edit(context)
+
+
+def select_all(context):
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        for vert in bm.verts:
+            vert.select = True
+        for edge in bm.edges:
+            edge.select = True
+        for face in bm.faces:
+            face.select = True
+        bm.select_flush_mode()
+        update(obj)
+
+
+def deselect_all(context):
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        for vert in bm.verts:
+            vert.select = False
+        for edge in bm.edges:
+            edge.select = False
+        for face in bm.faces:
+            face.select = False
+        bm.select_flush_mode()
+        update(obj)
+
+
+def invert_selection(context):
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        for vert in bm.verts:
+            if not vert.hide:
+                vert.select = not vert.select
+        for edge in bm.edges:
+            if not edge.hide:
+                edge.select = not edge.select
+        for face in bm.faces:
+            if not face.hide:
+                face.select = not face.select
+        bm.select_flush_mode()
+        update(obj)
+
+
+def select_linked(context):
+    """Select the whole connected component of every selected vertex."""
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        bm.verts.ensure_lookup_table()
+        stack = [v for v in bm.verts if v.select and not v.hide]
+        if not stack:
+            continue
+        visited = set(stack)
+        while stack:
+            vert = stack.pop()
+            for edge in vert.link_edges:
+                other = edge.other_vert(vert)
+                if other not in visited and not other.hide:
+                    visited.add(other)
+                    other.select = True
+                    stack.append(other)
+        bm.select_flush_mode()
+        update(obj)
+
+
+def merge_selected(context, dist=1e-4):
+    removed = 0
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        verts = [v for v in bm.verts if v.select and not v.hide]
+        if len(verts) < 2:
+            continue
+        before = len(bm.verts)
+        try:
+            bmesh.ops.remove_doubles(bm, verts=verts, dist=dist)
+        except Exception:  # noqa: BLE001
+            continue
+        removed += before - len(bm.verts)
+        bm.select_flush_mode()
+        update(obj)
+    return removed
+
+
+def delete_selected(context):
+    removed = 0
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        verts = [v for v in bm.verts if v.select and not v.hide]
+        if not verts:
+            continue
+        removed += len(verts)
+        try:
+            bmesh.ops.delete(bm, geom=verts, context="VERTS")
+        except Exception:  # noqa: BLE001
+            continue
+        update(obj)
+    return removed
