@@ -1,0 +1,9 @@
+schema_version = "1.0.0"
+id = "blender_vr_tweak"
+version = "0.0.1"
+name = "VR Tweak"
+tagline = "Direct mesh tweaking in VR"
+maintainer = "enlight"
+type = "add-on"
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
