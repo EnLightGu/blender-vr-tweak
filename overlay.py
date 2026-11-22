@@ -282,8 +282,21 @@ def hide_rotation():
     _hide_rotation()
 
 
+
+def _prune():
+    """Forget objects that a file load / cleanup removed from bpy.data."""
+    for key, obj in list(_OBJECTS.items()):
+        if obj is None:
+            continue
+        try:
+            obj.name
+        except ReferenceError:
+            _OBJECTS[key] = None
+
+
 def add(context):
     """Create the overlay objects (called from session.start)."""
+    _prune()
     if _OBJECTS["grip"] is not None:
         return
     _OBJECTS["grip"] = _link(context, _new_ring("vrtweak_grip_ring", 0.0011, _GRIP_COLOR))

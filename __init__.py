@@ -244,6 +244,12 @@ class VRTWEAK_PT_panel(Panel):
         layout.label(text=f"Log: {session.LOG_PATH}")
 
 
+def _on_load(*_args):
+    """Re-register the XR start handler: loading a .blend can clear handlers."""
+    if actions.session_pre not in bpy.app.handlers.xr_session_start_pre:
+        bpy.app.handlers.xr_session_start_pre.append(actions.session_pre)
+
+
 def _header(self, context):
     self.layout.operator("vrtweak.start", text="VR Tweak", icon="VIEW_CAMERA")
 
@@ -270,6 +276,8 @@ def register():
     bpy.types.Scene.vrtweak = bpy.props.PointerProperty(type=VRTweakSettings)
     if actions.session_pre not in bpy.app.handlers.xr_session_start_pre:
         bpy.app.handlers.xr_session_start_pre.append(actions.session_pre)
+    bpy.app.handlers.load_post.append(_on_load)
+    _on_load()
     bpy.types.VIEW3D_HT_header.append(_header)
     bpy.types.VIEW3D_MT_view.append(_menu)
 
@@ -283,6 +291,8 @@ def unregister():
     if actions.session_pre in bpy.app.handlers.xr_session_start_pre:
         bpy.app.handlers.xr_session_start_pre.remove(actions.session_pre)
     try:
+        if _on_load in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_on_load)
         bpy.types.VIEW3D_HT_header.remove(_header)
         bpy.types.VIEW3D_MT_view.remove(_menu)
     except Exception:  # noqa: BLE001

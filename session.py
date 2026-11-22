@@ -9,7 +9,7 @@ import tempfile
 import time
 
 import bpy
-from mathutils import Quaternion, Vector
+from mathutils import Matrix, Quaternion, Vector
 
 from . import actions, mesh, overlay, panel, tip, undo
 
@@ -40,6 +40,11 @@ _STATE = {
     "panel_visible": True,
     "ui_hover": False,
     "y_click": False,
+    "view_placed": False,
+    "ensure_t": 0.0,
+    "ensure_tries": 0,
+    "debug": None,
+    "not_running": 0,
 }
 
 
@@ -115,6 +120,8 @@ def _stick(context, hand):
     """Stick vector with the per-axis panel inversion applied."""
     x, y = actions.vector(context, "stick", hand)
     settings = context.scene.vrtweak
+    if actions.session_pre not in bpy.app.handlers.xr_session_start_pre:
+        bpy.app.handlers.xr_session_start_pre.append(actions.session_pre)
     if settings.invert_stick_x:
         x = -x
     if settings.invert_stick_y:
@@ -184,6 +191,18 @@ def _navigate(context, state, dt):
         delta = _stick_delta(rotation, stick, dt, speed)
     if delta.length:
         state.navigation_location = Vector(state.navigation_location) + delta
+    # Right stick Y: pitch the world around the right controller, not around the
+    # head: w' = P + q * (w - P) with P = right hand grip position.
+    pitch_stick = _stick(context, 1).y
+    if abs(pitch_stick) > 0.15:
+        angle = math.radians(settings.turn_angle) * pitch_stick * dt * 2.5
+        pivot = Vector(actions.pose(context, 1)[0] or state.viewer_pose_location)
+        right_axis = rotation @ Vector((1.0, 0.0, 0.0))
+        pitch_q = Quaternion(right_axis, angle)
+        nav_rot = Quaternion(state.navigation_rotation)
+        nav_loc = Vector(state.navigation_location)
+        state.navigation_rotation = pitch_q @ nav_rot
+        state.navigation_location = pivot + pitch_q @ (nav_loc - pivot)
     turn_stick = _stick(context, 1).x
     if abs(turn_stick) > 0.65:
         if _STATE["turn_armed"]:
@@ -208,8 +227,21 @@ def _toggle(context):
         raise RuntimeError("Open a 3D view first")
     region = next((r for r in area.regions if r.type == "WINDOW"), None)
     window = getattr(context, "window", None) or bpy.context.window
-    with bpy.context.temp_override(window=window, area=area, region=region):
-        bpy.ops.wm.xr_session_toggle()
+    result = None
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.wm.xr_session_toggle()
+    except Exception as exc:  # noqa: BLE001
+        result = f"EXC {exc!r}"
+        raise
+    finally:
+        try:
+            with open(LOG_PATH + ".toggle", "a", encoding="utf-8") as fh:
+                fh.write("%.1f result=%s running=%s mode=%s\n" % (
+                    time.time(), result, _is_running(bpy.context), bpy.context.mode))
+        except Exception:  # noqa: BLE001
+            pass
+    return result
 
 
 def _cleanup(context):
@@ -229,6 +261,8 @@ def _cleanup(context):
     panel.remove()
     overlay.remove()
     _remove_hud()
+    _remove_debug()
+    _remove_axis_cube()
     actions.reset()
     try:
         context.scene.vrtweak.running = False
@@ -236,19 +270,116 @@ def _cleanup(context):
         pass
 
 
-def start(context):
+def _purge_stale_objects():
+    """Delete vrtweak_* objects saved inside a .blend by an earlier session."""
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith("vrtweak_"):
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:  # noqa: BLE001
+                pass
+    # A deleted object can still be the active one, which breaks mode_set and XR ops.
+    try:
+        active = bpy.context.view_layer.objects.active
+        if active is None or active.name.startswith("vrtweak_"):
+            candidate = next(
+                (o for o in bpy.context.scene.objects
+                 if o.type == "MESH" and not o.name.startswith("vrtweak_")),
+                None,
+            )
+            bpy.context.view_layer.objects.active = candidate
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
+
+def _remove_debug():
+    obj = _STATE.get("debug")
+    _STATE["debug"] = None
+    if obj is None:
+        return
+    try:
+        data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and data.users == 0:
+            bpy.data.curves.remove(data)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ensure_debug(context):
+    if _STATE.get("debug") is not None:
+        return _STATE["debug"]
+    try:
+        curve = bpy.data.curves.new("vrtweak_debug", "FONT")
+        curve.size = 0.010
+        curve.align_x = "LEFT"
+        curve.align_y = "TOP"
+        curve.space_line = 0.9
+        for font_path in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"):
+            if os.path.exists(font_path):
+                try:
+                    curve.font = bpy.data.fonts.load(font_path)
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+        curve.materials.append(overlay._material("vrtweak_debug_mat", (1.0, 1.0, 1.0, 1.0), 1.0))
+        obj = bpy.data.objects.new("vrtweak_debug", curve)
+        context.scene.collection.objects.link(obj)
+        obj.hide_select = True
+        obj.hide_render = False
+        obj.show_in_front = True
+        obj.rotation_mode = "QUATERNION"
+        _STATE["debug"] = obj
+        return obj
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _update_debug(context, lines, state):
+    """Pin the debug text to the top-left of the viewer's field of view."""
+    obj = _STATE.get("debug") or _ensure_debug(context)
+    if obj is None or state is None:
+        return
+    try:
+        rot = Quaternion(state.viewer_pose_rotation)
+        loc = Vector(state.viewer_pose_location)
+        forward = rot @ Vector((0.0, 0.0, -1.0))
+        right = rot @ Vector((1.0, 0.0, 0.0))
+        up = rot @ Vector((0.0, 1.0, 0.0))
+        obj.data.body = "\n".join(lines)
+        obj.location = loc + forward * 1.0 + right * (-0.55) + up * 0.32
+        obj.rotation_quaternion = rot
+        obj.hide_viewport = False
+    except Exception:  # noqa: BLE001
+        pass
+
+def _register_xr_handler():
+    """Loading a .blend clears Python XR handlers, so register it again on start."""
+    try:
+        if actions.session_pre not in bpy.app.handlers.xr_session_start_pre:
+            bpy.app.handlers.xr_session_start_pre.append(actions.session_pre)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _begin(context):
     settings = context.scene.vrtweak
-    # View-only sessions are allowed: the panel's 编辑/物体 button can enter edit mode later.
-    if not mesh.try_enter_edit(context):
-        settings.status = "view only（左Y → 编辑/物体）"
-    undo.clear()
-    with open(LOG_PATH, "w", encoding="utf-8") as handle:
-        handle.write("# vrtweak input log\n")
-    actions.reset()
-    _toggle(context)
+    try:
+        context.window_manager.xr_session_settings.controller_draw_style = "LIGHT"
+    except Exception:  # noqa: BLE001
+        pass
+    for suffix in (".hb", ".err"):
+        try:
+            os.remove(LOG_PATH + suffix)
+        except OSError:
+            pass
     overlay.add(context)
     panel.add(context)
     _ensure_hud(context)
+    _ensure_debug(context)
+    _ensure_axis_cube(context)
     _STATE.update({
         "last": 0.0,
         "trigger_r": False,
@@ -257,10 +388,60 @@ def start(context):
         "grabbing": False,
         "grab_start": None,
         "translate": None,
+        "view_placed": False,
+        "ensure_tries": 0,
+        "started_at": time.time(),
     })
     _STATE["timer"] = bpy.app.timers.register(tick, first_interval=0.05, persistent=True)
     settings.running = True
-    settings.status = "waiting for XR session"
+    settings.status = "运行中 / running"
+
+
+def _restart_session():
+    """Reopen the XR session so that xr_session_start_pre runs again."""
+    context = bpy.context
+    try:
+        _register_xr_handler()
+        actions.reset()
+        _toggle(context)
+        _begin(context)
+    except Exception as exc:  # noqa: BLE001
+        context.scene.vrtweak.status = f"重启失败 / restart failed: {exc}"
+    return None
+
+
+def start(context):
+    overlay.remove()
+    panel.remove()
+    _purge_stale_objects()
+    settings = context.scene.vrtweak
+    undo.clear()
+    with open(LOG_PATH, "w", encoding="utf-8") as handle:
+        handle.write("# vrtweak input log\n")
+    actions.reset()
+    _register_xr_handler()
+    running = _is_running(context)
+    if running and actions.ready():
+        _begin(context)          # already healthy: just attach
+        if not mesh.try_enter_edit(context):
+            settings.status = "view only / 仅查看（左Y → 编辑）"
+        return
+    if running:
+        # A stale session was opened by something else: the action set can only be
+        # built in xr_session_start_pre, so close and reopen it (about half a second).
+        settings.status = "重启连接 / reopening session"
+        try:
+            _toggle(context)
+        except Exception:  # noqa: BLE001
+            pass
+        bpy.app.timers.register(_restart_session, first_interval=0.6, persistent=True)
+        return
+    _toggle(context)
+    _begin(context)
+    # Edit mode only after the session exists: switching mode first made the XR
+    # toggle return without opening a session.
+    if not mesh.try_enter_edit(context):
+        settings.status = "view only / 仅查看（左Y → 编辑）"
 
 
 def stop(context):
@@ -359,6 +540,165 @@ def _queue_save():
     bpy.app.timers.register(_save_async, first_interval=0.01)
 
 
+
+
+_AXIS = {}
+
+
+def _axis_label(name, body, x, y, z, rot):
+    cu = bpy.data.curves.new(name, "FONT")
+    cu.body = body
+    cu.size = 0.020
+    cu.align_x = "CENTER"
+    cu.align_y = "CENTER"
+    for font_path in ("C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc"):
+        if os.path.exists(font_path):
+            try:
+                cu.font = bpy.data.fonts.load(font_path)
+            except Exception:  # noqa: BLE001
+                pass
+            break
+    cu.materials.append(overlay._material("vrtweak_axistext_mat", (1.0, 1.0, 1.0, 1.0), 1.5))
+    obj = bpy.data.objects.new(name, cu)
+    obj.color = (1.0, 1.0, 1.0, 1.0)
+    obj.location = (x, y, z)
+    return obj
+
+
+def _make_hand_box(context, name, color, size=(0.032, 0.032, 0.070)):
+    sx, sy, sz = size
+    mesh = bpy.data.meshes.new(name)
+    verts = [(x * sx, y * sy, z * sz) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+    faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(overlay._material(name + "_mat", color, 1.0))
+    obj = bpy.data.objects.new(name, mesh)
+    obj.color = color
+    obj.hide_select = True
+    obj.hide_render = False
+    context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _ensure_axis_cube(context):
+    return None
+
+
+def _update_axis_cube(context, hand=0):
+    """Draw a solid box on both controllers (covers Blender's fallback spheres)."""
+    if _AXIS.get("left") is None:
+        _ensure_axis_cube(context)
+    try:
+        state = context.window_manager.xr_session_state
+        if state is None:
+            return
+        for index, key in ((0, "left"), (1, "right")):
+            obj = _AXIS.get(key)
+            if obj is None:
+                continue
+            loc = Vector(state.controller_grip_location_get(context, index))
+            rot = state.controller_grip_rotation_get(context, index)
+            if rot is None or loc.length < 1e-4:
+                pose = actions.pose(context, index)
+                if pose[0] is None or pose[1] is None:
+                    obj.hide_viewport = True
+                    continue
+                loc = Vector(pose[0])
+                rot = pose[1]
+            quat = Quaternion(rot)
+            world = Matrix.Translation(loc) @ quat.to_matrix().to_4x4()
+            obj.matrix_world = world
+            obj.hide_viewport = False
+            if key == "left" and (time.time() - _STATE.get("started_at", time.time())) < 20.0:
+                billboard = Quaternion(state.viewer_pose_rotation).to_matrix().to_4x4()
+                for index in range(6):
+                    item = _AXIS.get("lbl_%d" % index)
+                    if item is None:
+                        continue
+                    label, offset = item
+                    label.matrix_world = Matrix.Translation(world @ offset) @ billboard
+                    label.hide_viewport = False
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        _axis_log("EXC %r\n%s" % (exc, traceback.format_exc()))
+
+
+def _hide_axis_labels():
+    return
+
+
+def _remove_axis_cube():
+    for key in ("left", "right"):
+        obj = _AXIS.pop(key, None)
+        if obj is None:
+            continue
+        data = getattr(obj, "data", None)
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if data is not None and data.users == 0:
+                bpy.data.meshes.remove(data)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _axis_log(text):
+    try:
+        with open(LOG_PATH + ".axis", "a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
+def _place_view(context):
+    """Put the viewer 2 m in front of the origin, looking at it (once per session)."""
+    try:
+        state = context.window_manager.xr_session_state
+        if state is None:
+            return False
+        view_loc = Vector(state.viewer_pose_location)
+        if view_loc.length < 0.1:
+            # Tracking has not produced a real pose yet: retry on the next frame,
+            # otherwise the navigation gets a bogus offset and the view ends up far.
+            return False
+        view_rot = Quaternion(state.viewer_pose_rotation)
+        nav_loc = Vector(state.navigation_location)
+        nav_rot = Quaternion(state.navigation_rotation)
+        base_rot = nav_rot.inverted() @ view_rot
+        target_loc = Vector((0.0, -2.0, 1.7))
+        target_rot = (Vector((0.0, 0.0, 0.0)) - target_loc).to_track_quat("-Z", "Y")
+        new_nav_rot = target_rot @ base_rot.inverted()
+        offset = nav_rot.inverted() @ (view_loc - nav_loc)
+        state.navigation_rotation = new_nav_rot
+        state.navigation_location = target_loc - new_nav_rot @ offset
+        state.navigation_scale = 1.0
+        context.scene.vrtweak.status = "视角已归位 / view placed"
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reset_view(context):
+    state = context.window_manager.xr_session_state
+    if state is None:
+        return False
+    state.navigation_location = Vector((0.0, 0.0, 0.0))
+    state.navigation_rotation = Quaternion()
+    state.navigation_scale = 1.0
+    return True
+
+
+def _set_panel_visible(visible):
+    _STATE["panel_visible"] = bool(visible)
+    if not visible:
+        panel.hide()
+    return _STATE["panel_visible"]
+
+
 def _panel_dispatch(context):
     """Map floating-panel button ids to mesh operations."""
     settings = context.scene.vrtweak
@@ -385,18 +725,125 @@ def _panel_dispatch(context):
         "undo": wrap(lambda ctx: undo.undo(ctx), "撤销"),
         "save": wrap(lambda ctx: _queue_save(), "保存"),
         "editmode": wrap(mesh.toggle_edit_mode, "编辑模式"),
+        "mode_vert": wrap(lambda ctx: mesh.set_select_mode(ctx, "VERT"), "顶点模式"),
+        "mode_edge": wrap(lambda ctx: mesh.set_select_mode(ctx, "EDGE"), "边模式"),
+        "mode_face": wrap(lambda ctx: mesh.set_select_mode(ctx, "FACE"), "面模式"),
+        "subdivide": wrap(mesh.subdivide_selected, "细分"),
+        "extrude": wrap(mesh.extrude_selected, "挤出"),
+        "flip_normals": wrap(mesh.flip_normals_selected, "法线翻转"),
+        "reset_view": wrap(_reset_view, "重置视角"),
+        "hide_panel": wrap(lambda ctx: _set_panel_visible(False), "隐藏面板"),
+        "help": wrap(lambda ctx: panel.go_to_page("help"), "帮助"),
     }
 
 
+def apply_two_hand_view(pinch, left_tip, right_tip, state, invert=False):
+    """Apply the two-hand view transform, measured in base space.
+
+    Controller poses come back world-space (navigation applied), so the hand
+    transform is derived in base space to avoid feeding our own navigation
+    back in (that caused the endless spin, see README 5.5 6).
+
+    Updates ``state.navigation_rotation`` / ``state.navigation_location`` and
+    returns the base-space hand rotation (or None). The caller handles scale.
+    """
+    nav_rot_now = Quaternion(state.navigation_rotation)
+    nav_loc_now = Vector(state.navigation_location)
+    scale_now = max(float(state.navigation_scale), 1e-6)
+    inv_rot = nav_rot_now.inverted()
+    inv_scale = 1.0 / scale_now
+    left_base = inv_rot @ (left_tip - nav_loc_now) * inv_scale
+    right_base = inv_rot @ (right_tip - nav_loc_now) * inv_scale
+    base_mid_now = (left_base + right_base) * 0.5
+    delta_base = base_mid_now - pinch["base_mid"]
+    base_axis_now = None
+    if (right_base - left_base).length > 1e-5:
+        base_axis_now = (right_base - left_base).normalized()
+    hand_rot = None
+    if pinch.get("base_axis") is not None and base_axis_now is not None:
+        hand_rot = pinch["base_axis"].rotation_difference(base_axis_now)
+    if invert:
+        delta_base = -delta_base
+        if hand_rot is not None:
+            hand_rot = hand_rot.inverted()
+    if hand_rot is not None:
+        new_rot = (pinch["nav_rot"] @ hand_rot.inverted()).normalized()
+    else:
+        new_rot = pinch["nav_rot"].copy()
+    if pinch["base_viewer"] is not None:
+        new_loc = pinch["viewer"] - (new_rot @ (pinch["base_viewer"] + delta_base)) * pinch["nav_scale"]
+    else:
+        new_loc = nav_loc_now
+    state.navigation_rotation = new_rot
+    state.navigation_location = new_loc
+    return hand_rot
+
+
 def tick():
+    """Timer entry point: never let one bad frame unregister the timer."""
+    try:
+        return _tick_body()
+    except Exception:  # noqa: BLE001
+        try:
+            import traceback
+            with open(LOG_PATH + ".err", "a", encoding="utf-8") as fh:
+                fh.write(time.strftime("%H:%M:%S ") + traceback.format_exc() + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        return 0.05
+
+
+def _tick_body():
     context = bpy.context
     if not _is_running(context):
-        _cleanup(context)
-        return None
+        # A freshly requested session needs a few frames before is_running() flips
+        # to True. Cleaning up on the first frame used to kill the timer, which left
+        # the panel invisible and every button dead.
+        _STATE["not_running"] = _STATE.get("not_running", 0) + 1
+        if _STATE["not_running"] > 80:
+            _cleanup(context)
+            return None
+        return 0.05
+    _STATE["not_running"] = 0
 
     settings = context.scene.vrtweak
     settings.running = True
     state = context.window_manager.xr_session_state
+
+    _update_axis_cube(context, 0)
+    if state is not None and not _STATE.get("view_placed"):
+        if _place_view(context):
+            _STATE["view_placed"] = True
+    if state is not None and not actions.ready():
+        now_e = time.time()
+        if now_e - _STATE.get("ensure_t", 0.0) > 0.5 and _STATE.get("ensure_tries", 0) < 20:
+            _STATE["ensure_t"] = now_e
+            _STATE["ensure_tries"] = _STATE.get("ensure_tries", 0) + 1
+            try:
+                if actions.ensure(context):
+                    settings.status = "动作集就绪 / action set ready"
+            except Exception:  # noqa: BLE001
+                pass
+
+    _STATE["frames"] = _STATE.get("frames", 0) + 1
+    if time.time() - _STATE.get("hb", 0.0) > 0.5:
+        _STATE["hb"] = time.time()
+        try:
+            with open(LOG_PATH + ".hb", "a", encoding="utf-8") as fh:
+                fh.write(
+                    "frames=%d ready=%s trigger=%s y=%s panel_vis=%s panel_objs=%s gripL=%s box=%s\n" % (
+                        _STATE["frames"], actions.ready(),
+                        actions.value(context, "trigger", 1),
+                        actions.value(context, "y_click", 0),
+                        _STATE.get("panel_visible"),
+                        sum(1 for o in getattr(panel, "_ALL_OBJECTS", []) if not o.hide_viewport)
+                        if getattr(panel, "_ALL_OBJECTS", None) else -1,
+                        tuple(round(v, 2) for v in actions.pose(context, 0)[0]) if actions.pose(context, 0)[0] else None,
+                        tuple(round(v, 2) for v in _AXIS["root"].matrix_world.translation) if _AXIS.get("root") else None,
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     hand = 1 if settings.hand == "RIGHT" else 0
     tip_loc, grip_loc = tip.read(context, hand, settings.tip_offset, settings.tip_source)
@@ -417,6 +864,10 @@ def tick():
         else ("EDGE" if context.tool_settings.mesh_select_mode[1] else "FACE")
     )
     points, lines, tris = _STATE["sel"]
+    try:
+        overlay._prune()
+    except Exception:  # noqa: BLE001
+        pass
     overlay.update(
         tip=tip_loc,
         grip=grip_loc,
@@ -435,13 +886,28 @@ def tick():
     y_click = actions.value(context, "y_click", 0) > 0.55
     if y_click and not _STATE["y_click"]:
         _STATE["panel_visible"] = not _STATE["panel_visible"]
-        _toast("面板显示" if _STATE["panel_visible"] else "面板隐藏")
+        _toast("面板显示 / Panel on" if _STATE["panel_visible"] else "面板隐藏 / Panel off")
     _STATE["y_click"] = y_click
     ui = {"hover": False, "clicked": None}
     if state is not None and not (trigger_l and trigger_r):
         try:
             grip_pose = actions.pose(context, 0)
+            if grip_pose[0] is None or grip_pose[1] is None:
+                # action-state read can be empty; the raw controller pose is reliable
+                grip_pose = (
+                    Vector(state.controller_grip_location_get(context, 0)),
+                    Quaternion(state.controller_grip_rotation_get(context, 0)),
+                )
             aim_pose = actions.aim_pose(context, 1)
+            if aim_pose[0] is None or aim_pose[1] is None:
+                aim_pose = (
+                    Vector(state.controller_aim_location_get(context, 1)),
+                    Quaternion(state.controller_aim_rotation_get(context, 1)),
+                )
+            try:
+                panel._prune()
+            except Exception:  # noqa: BLE001
+                pass
             ui = panel.update(
                 context,
                 viewer=Vector(state.viewer_pose_location),
@@ -454,13 +920,41 @@ def tick():
                 dispatch=_panel_dispatch(context),
             )
         except Exception as exc:  # noqa: BLE001
+            import traceback
+            try:
+                with open(LOG_PATH + ".err", "a", encoding="utf-8") as fh:
+                    fh.write(traceback.format_exc() + "\n")
+            except Exception:  # noqa: BLE001
+                pass
             settings.status = f"panel error: {exc}"
             ui = {"hover": False, "clicked": None}
     else:
         panel.hide()
     _STATE["ui_hover"] = bool(ui.get("hover"))
     if ui.get("clicked"):
-        settings.status = f"panel: {ui['clicked']}"
+        settings.status = f"面板 / panel: {ui['clicked']}"
+
+    try:
+        squeeze_l = actions.value(context, "squeeze", 0)
+        squeeze_r = actions.value(context, "squeeze", 1)
+        a_click = actions.value(context, "a_click", 1)
+        b_click = actions.value(context, "b_click", 1)
+        x_click = actions.value(context, "x_click", 0)
+        panel_objects = getattr(panel, "_ALL_OBJECTS", None)
+        panel_visible = sum(1 for o in panel_objects if not o.hide_viewport) if panel_objects else -1
+        _update_debug(context, [
+            "VR Tweak 调试 / debug",
+            f"帧 / frames {_STATE.get('frames', 0)}  动作集 / set {actions.ready()}",
+            f"扳机 / trigger L{trigger_l:.2f} R{trigger_r:.2f}",
+            f"握把 / grip L{squeeze_l:.2f} R{squeeze_r:.2f}",
+            f"按钮 / buttons Y{int(y_click)} A{int(a_click)} B{int(b_click)} X{int(x_click)}",
+            f"面板 / panel vis{int(bool(_STATE.get('panel_visible')))} objs{panel_visible} hover{int(bool(ui.get('hover')))}",
+            f"左手 / gripL {tuple(round(v,2) for v in state.controller_grip_location_get(context, 0))}",
+            f"方块 / box {tuple(round(v,2) for v in _AXIS['root'].matrix_world.translation) if _AXIS.get('root') else None}",
+            f"状态 / status {settings.status}",
+        ], state)
+    except Exception:  # noqa: BLE001
+        pass
 
     if _STATE["hud"] is not None and tip_loc is not None and not _STATE["grabbing"] and _STATE["pinch"] is None:
         if time.time() - _STATE.get("last_pick", 0.0) > 0.1:
@@ -473,12 +967,12 @@ def tick():
         if not mesh.objects_in_edit(context):
             text = "未进入编辑模式（左Y 面板 → 编辑/物体）"
         else:
-            mode = "顶点" if context.tool_settings.mesh_select_mode[0] else ("边" if context.tool_settings.mesh_select_mode[1] else "面")
+            mode = "顶点/Vertex" if context.tool_settings.mesh_select_mode[0] else ("边/Edge" if context.tool_settings.mesh_select_mode[1] else "面/Face")
             preselect = _STATE["preselect"]
             if preselect and preselect[0] is not None:
-                text = f"预选：{preselect[0].name} / {mode}"
+                text = f"预选 / Preview: {preselect[0].name} / {mode}"
             else:
-                text = f"预选：无（{mode}）"
+                text = f"预选 / Preview: 无 / none ({mode})"
         _update_hud(context, text)
     elif _STATE["hud"] is not None:
         _update_hud(context, "移动中" if _STATE["pinch"] is None else "双手操作中")
@@ -520,7 +1014,7 @@ def tick():
                 "base_viewer": base_viewer,
                 "angle": 0.0,
             }
-            settings.status = "two-hand grab: selection" if grabbed else "two-hand grab: view"
+            settings.status = "双手-选中 / grab selection" if grabbed else "双手-视图 / grab view"
         else:
             shift = distance - pinch["start_dist"]
             factor = max(0.2, min(5.0, 1.0 + shift * settings.pinch_gain))
@@ -533,39 +1027,9 @@ def tick():
                 pinch["handler"].apply(context, delta, factor, rotation)
                 overlay.hide_rotation()
             elif state is not None:
-                # Measure the hands in base space (see the pinch start above).
-                nav_rot_now = Quaternion(state.navigation_rotation)
-                nav_loc_now = Vector(state.navigation_location)
-                scale_now = max(float(state.navigation_scale), 1e-6)
                 view_factor = max(0.2, min(5.0, 1.0 + shift * settings.view_pinch_gain))
-                inv_rot = nav_rot_now.inverted()
-                inv_scale = 1.0 / scale_now
-                left_base = inv_rot @ (left_tip - nav_loc_now) * inv_scale
-                right_base = inv_rot @ (right_tip - nav_loc_now) * inv_scale
-                base_mid_now = (left_base + right_base) * 0.5
-                delta_base = base_mid_now - pinch["base_mid"]
-                base_axis_now = None
-                if (right_base - left_base).length > 1e-5:
-                    base_axis_now = (right_base - left_base).normalized()
-                hand_rot = None
-                if pinch.get("base_axis") is not None and base_axis_now is not None:
-                    hand_rot = pinch["base_axis"].rotation_difference(base_axis_now)
-
-                if settings.invert_grab:
-                    delta_base = -delta_base
-                    if hand_rot is not None:
-                        hand_rot = hand_rot.inverted()
-
-                if hand_rot is not None:
-                    new_rot = (pinch["nav_rot"] @ hand_rot.inverted()).normalized()
-                else:
-                    new_rot = pinch["nav_rot"].copy()
-                if pinch["base_viewer"] is not None:
-                    new_loc = pinch["viewer"] - (new_rot @ (pinch["base_viewer"] + delta_base)) * pinch["nav_scale"]
-                else:
-                    new_loc = nav_loc_now
-                state.navigation_rotation = new_rot
-                state.navigation_location = new_loc
+                nav_rot_before = Quaternion(state.navigation_rotation)
+                hand_rot = apply_two_hand_view(pinch, left_tip, right_tip, state, settings.invert_grab)
                 applied = (1.0 / view_factor) if settings.pinch_invert else view_factor
                 state.navigation_scale = max(0.1, min(10.0, pinch["nav_scale"] * applied))
 
@@ -573,7 +1037,7 @@ def tick():
                 pinch["angle"] = angle_deg
                 axis_world = None
                 if hand_rot is not None and angle_deg >= 0.5:
-                    axis_world = (nav_rot_now @ hand_rot.axis).normalized()
+                    axis_world = (nav_rot_before @ hand_rot.axis).normalized()
                 overlay.show_rotation(mid, axis_world, angle_deg, pinch["viewer"])
         _STATE["trigger_r"] = True
         return 0.05
@@ -583,11 +1047,11 @@ def tick():
         if pinch["handler"] is not None:
             try:
                 undo.push_base(context, pinch["handler"].base)
-                settings.status = "two-hand transform committed"
+                settings.status = "已提交 / committed"
             except Exception as exc:  # noqa: BLE001
                 settings.status = f"pinch commit error: {exc}"
         else:
-            settings.status = "view moved"
+            settings.status = "视图已移动 / view moved"
         _STATE["trigger_r"] = False
         return 0.05
 
@@ -595,7 +1059,7 @@ def tick():
     if stick_click and not _STATE["stick_click_l"]:
         settings.vertical_move = not settings.vertical_move
         settings.status = "move: vertical" if settings.vertical_move else "move: horizontal"
-        _toast("垂直移动" if settings.vertical_move else "水平移动")
+        _toast("垂直移动 / Vertical" if settings.vertical_move else "水平移动 / Horizontal")
     _STATE["stick_click_l"] = stick_click
     if state is not None and not _STATE["grabbing"]:
         try:
@@ -620,7 +1084,7 @@ def tick():
                     settings.status = f"selected {kind} on {obj.name}"
                 else:
                     mesh.brush_select(context, tip_loc, radius, additive=True)
-                    settings.status = "selecting"
+                    settings.status = "刷选中 / selecting"
             elif settings.brush_multi:
                 mesh.brush_select(context, tip_loc, radius, additive=True)
         except Exception as exc:  # noqa: BLE001
@@ -635,11 +1099,11 @@ def tick():
             if _STATE["translate"].begin(context):
                 _STATE["grabbing"] = True
                 _STATE["grab_start"] = tip_loc.copy()
-                settings.status = "grabbing"
+                settings.status = "拖动中 / grabbing"
     if not squeeze_r and _STATE["squeeze_r"] and _STATE["grabbing"]:
         try:
             undo.push_translate(context, _STATE["translate"])
-            settings.status = "moved"
+            settings.status = "已移动 / moved"
         except Exception as exc:  # noqa: BLE001
             settings.status = f"undo push error: {exc}"
         _STATE["grabbing"] = False
@@ -682,7 +1146,7 @@ def tick():
     _STATE["a_click"] = a_click
 
     if b_click and not _STATE["b_click"]:
-        settings.status = "saving..."
+        settings.status = "保存中 / saving..."
         bpy.app.timers.register(_save_async, first_interval=0.01)
     _STATE["b_click"] = b_click
 
@@ -690,7 +1154,7 @@ def tick():
         try:
             mode = mesh.cycle_select_mode(context)
             settings.status = f"select mode: {mode}"
-            _toast({"VERT": "顶点模式", "EDGE": "边模式", "FACE": "面模式"}.get(mode, mode))
+            _toast({"VERT": "顶点 / Vertex", "EDGE": "边 / Edge", "FACE": "面 / Face"}.get(mode, mode))
         except Exception as exc:  # noqa: BLE001
             settings.status = f"mode error: {exc}"
     _STATE["x_click"] = x_click

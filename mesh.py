@@ -580,3 +580,75 @@ def delete_selected(context):
             continue
         update(obj)
     return removed
+
+
+def set_select_mode(context, mode):
+    modes = {"VERT": (True, False, False), "EDGE": (False, True, False), "FACE": (False, False, True)}
+    if mode not in modes:
+        return False
+    context.tool_settings.mesh_select_mode = modes[mode]
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        bm.select_mode = {mode}
+        bm.select_flush_mode()
+        update(obj)
+    return True
+
+
+def subdivide_selected(context, cuts=1):
+    changed = 0
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        edges = [e for e in bm.edges if e.select]
+        if not edges:
+            verts = {v for v in bm.verts if v.select}
+            edges = [e for e in bm.edges if e.verts[0] in verts and e.verts[1] in verts]
+        if not edges:
+            continue
+        try:
+            bmesh.ops.subdivide_edges(bm, edges=edges, cuts=cuts, use_grid_fill=True)
+        except Exception:  # noqa: BLE001
+            continue
+        changed += 1
+        update(obj)
+    return changed
+
+
+def extrude_selected(context, distance=0.02):
+    changed = 0
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        faces = [f for f in bm.faces if f.select]
+        if not faces:
+            continue
+        normal = Vector((0.0, 0.0, 0.0))
+        for face in faces:
+            normal += face.normal
+        if normal.length < 1e-6:
+            normal = Vector((0.0, 0.0, 1.0))
+        normal.normalize()
+        try:
+            result = bmesh.ops.extrude_face_region(bm, geom=faces)
+            verts = [v for v in result["geom"] if isinstance(v, bmesh.types.BMVert)]
+            bmesh.ops.translate(bm, verts=verts, vec=normal * distance)
+        except Exception:  # noqa: BLE001
+            continue
+        changed += 1
+        update(obj)
+    return changed
+
+
+def flip_normals_selected(context):
+    changed = 0
+    for obj in objects_in_edit(context):
+        bm = bm_for(obj)
+        faces = [f for f in bm.faces if f.select]
+        if not faces:
+            continue
+        try:
+            bmesh.ops.reverse_faces(bm, faces=faces)
+        except Exception:  # noqa: BLE001
+            continue
+        changed += 1
+        update(obj)
+    return changed

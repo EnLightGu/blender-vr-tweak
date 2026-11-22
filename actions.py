@@ -41,6 +41,7 @@ ACTIONS = (
 TOUCH_BUTTONS = {"stick_click", "a_click", "b_click", "x_click", "y_click"}
 
 _ready = False
+_ensured = False
 _DBG = os.path.join(tempfile.gettempdir(), "vrtweak-actions.log")
 
 
@@ -53,7 +54,8 @@ def _log(msg):
 
 
 def reset():
-    global _ready
+    global _ready, _ensured
+    _ensured = False
     _ready = False
 
 
@@ -63,9 +65,12 @@ def ready():
 
 def ensure(context):
     """Create + activate the action set. Returns True on success."""
-    global _ready
+    global _ready, _ensured
     if _ready:
         return True
+    if _ensured:
+        return False
+    _ensured = True
     state = context.window_manager.xr_session_state
     _log(f"ensure state={state is not None}")
     if state is None:
